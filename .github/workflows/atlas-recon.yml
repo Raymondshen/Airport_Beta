@@ -1,0 +1,27 @@
+name: Atlas Recon (Run Once)
+
+on:
+  workflow_dispatch: # manual trigger only — run it, read logs, then delete
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright + Chromium
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
+
+      - name: Run Atlas Recon
+        run: node .github/scripts/atlas-recon.js
