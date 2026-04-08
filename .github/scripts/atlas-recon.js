@@ -1,173 +1,145 @@
-// atlas-recon-v4.js
-// STRATEGY: Stop guessing URL patterns.
-// Instead: fetch and read the compiled JS bundles to find:
-//   - actual route definitions
-//   - API endpoint strings
-//   - any airport code references
-//   - fetch/axios calls with real URLs
+// atlas-recon-v5.js
+// STRATEGY: Use page.route() to intercept JS bundles BEFORE navigation starts.
+// Also directly fetch bundle URLs we already know from previous runs.
 
 const { chromium } = require('playwright');
 
 const BASE = 'https://atlas-navigation.com';
 
+// We already know these bundle filenames from v2/v3 output — fetch them directly
+const KNOWN_BUNDLES = [
+  '01f1485904d0eaa2.js',
+  '236f7e5abd6f09ff.js',
+  '930e6194b8655375.js',
+  '249261e921aeebba.js',
+  '19e831b7929c9b12.js',
+  '28969971b9d960c8.js',
+  'ff1a16fafef87110.js',
+  '7340adf74ff47ec0.js',
+];
+
+const DPL = 'dpl_BFTjrdL631G5JfuKaq6LzLgmkLU9';
+
+async function fetchAndScan(page, filename) {
+  const url = `${BASE}/_next/static/chunks/${filename}?dpl=${DPL}`;
+  console.log(`\n📦 Scanning: ${filename}`);
+
+  let src = '';
+  try {
+    // Use Node's built-in fetch (Node 18+)
+    const resp = await fetch(url);
+    src = await resp.text();
+  } catch (e) {
+    // Fallback: use page context
+    try {
+      src = await page.evaluate(async (u) => {
+        const r = await fetch(u);
+        return r.text();
+      }, url);
+    } catch (e2) {
+      console.log(`  ❌ Failed: ${e2.message}`);
+      return;
+    }
+  }
+
+  if (!src || src.length < 100) {
+    console.log(`  ⚠️  Empty or tiny response (${src.length} chars)`);
+    return;
+  }
+
+  console.log(`  Size: ${src.length} chars`);
+
+  // ── Targeted extractions ──────────────────────────────────────────
+  const results = {
+    apiRoutes:    [...new Set((src.match(/["'`](\/api\/[^"'`\s]{2,80})["'`]/g) || []))],
+    fetchCalls:   [...new Set((src.match(/fetch\(["'`][^"'`]{5,120}["'`]/g) || []))],
+    externalUrls: [...new Set((src.match(/https?:\/\/[a-zA-Z0-9._-]{4,60}[^\s"'`<>]{0,60}/g) || [])
+                    .filter(u => !u.includes('google') && !u.includes('gtag') && !u.includes('doubleclick')))],
+    supabase:     src.match(/.{0,60}supabase.{0,80}/gi) || [],
+    airportATL:   (src.match(/.{0,40}ATL.{0,60}/g) || []).slice(0, 5),
+    routeStrings: [...new Set((src.match(/["'`]\/[a-z][a-z0-9/-]{2,40}["'`]/g) || [])
+                    .filter(s => !s.includes('next') && !s.includes('static') && !s.includes('.js')))].slice(0, 20),
+  };
+
+  let hasHits = false;
+  for (const [key, vals] of Object.entries(results)) {
+    if (vals.length > 0) {
+      hasHits = true;
+      console.log(`  ✅ ${key} (${vals.length}):`);
+      vals.slice(0, 10).forEach(v => console.log(`      ${v}`));
+    }
+  }
+
+  if (!hasHits) {
+    // Dump first 800 chars so we can see what's in it
+    console.log('  No structured hits. Raw snippet:');
+    console.log('  ' + src.slice(0, 800).replace(/\n/g, ' '));
+  }
+}
+
 (async () => {
-  console.log('\nATLAS RECON v4 — Reading JS bundles for routes + endpoints');
+  console.log('\nATLAS RECON v5 — Direct bundle fetch + scan');
   console.log('='.repeat(60));
 
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
-
   const page = await browser.newPage();
 
-  // Step 1: Load the homepage (always works) to get bundle URLs
-  console.log('\n[1] Loading homepage to collect bundle URLs...');
-  const bundleUrls = [];
-  page.on('request', req => {
-    const u = req.url();
-    if (u.includes('/_next/static/chunks') && u.endsWith('.js')) {
-      bundleUrls.push(u);
+  // ── Phase 1: Scan all known bundles directly ─────────────────────
+  console.log('\n[PHASE 1] Scanning known bundles from previous recon...');
+  for (const filename of KNOWN_BUNDLES) {
+    await fetchAndScan(page, filename);
+  }
+
+  // ── Phase 2: Navigate to homepage, intercept ANY new bundle names ─
+  console.log('\n\n[PHASE 2] Navigate to homepage and intercept bundle list...');
+  const interceptedBundles = new Set();
+
+  await page.route('**/_next/static/chunks/*.js*', async route => {
+    const url = route.request().url();
+    const name = url.split('/').pop().split('?')[0];
+    if (!KNOWN_BUNDLES.includes(name)) {
+      interceptedBundles.add(name);
     }
+    await route.continue();
   });
 
   await page.goto(BASE, { waitUntil: 'networkidle', timeout: 30000 });
-  await page.waitForTimeout(2000);
-  console.log(`  Found ${bundleUrls.length} JS bundles`);
+  await page.waitForTimeout(3000);
 
-  // Step 2: Fetch and scan EVERY bundle for useful strings
-  console.log('\n[2] Scanning all bundles...');
-
-  const findings = {
-    routes: [],
-    apiEndpoints: [],
-    fetchCalls: [],
-    supabase: [],
-    airportRefs: [],
-    misc: []
-  };
-
-  for (const url of bundleUrls) {
-    let src = '';
-    try {
-      const resp = await page.evaluate(async (u) => {
-        const r = await fetch(u);
-        return r.text();
-      }, url);
-      src = resp;
-    } catch (e) {
-      console.log(`  ⚠️  Could not fetch: ${url.split('/').pop()}`);
-      continue;
-    }
-
-    const filename = url.split('/').pop().split('?')[0];
-    const hits = [];
-
-    // Route patterns
-    const routeMatches = src.match(/["'`]\/[a-zA-Z][a-zA-Z0-9\-_/[\]]{2,60}["'`]/g) || [];
-    routeMatches
-      .filter(m => !m.includes('_next') && !m.includes('static') && !m.includes('.js') && !m.includes('.css'))
-      .forEach(m => findings.routes.push({ file: filename, val: m }));
-
-    // API endpoints
-    const apiMatches = src.match(/["'`](\/api\/[^"'`\s]{2,60})["'`]/g) || [];
-    apiMatches.forEach(m => findings.apiEndpoints.push({ file: filename, val: m }));
-
-    // External fetch/axios calls
-    const fetchMatches = src.match(/fetch\(["'`][^"'`]{8,100}["'`]/g) || [];
-    fetchMatches.forEach(m => findings.fetchCalls.push({ file: filename, val: m }));
-
-    // Supabase
-    if (/supabase/i.test(src)) {
-      const sbMatches = src.match(/.{0,40}supabase.{0,80}/gi) || [];
-      sbMatches.forEach(m => findings.supabase.push({ file: filename, val: m }));
-    }
-
-    // Airport code references
-    if (/\bATL\b/.test(src)) {
-      const atlMatches = src.match(/.{0,30}\bATL\b.{0,60}/g) || [];
-      atlMatches.slice(0, 5).forEach(m => findings.airportRefs.push({ file: filename, val: m }));
-    }
-
-    // URLs with domain
-    const urlMatches = src.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-_/?=&%]{10,100}/g) || [];
-    urlMatches
-      .filter(u => !u.includes('google') && !u.includes('gtag') && !u.includes('doubleclick') && !u.includes('atlas-navigation.com/og'))
-      .forEach(m => findings.misc.push({ file: filename, val: m }));
+  console.log(`  Intercepted ${interceptedBundles.size} new bundles on homepage`);
+  for (const name of interceptedBundles) {
+    await fetchAndScan(page, name);
   }
 
-  // Step 3: Print findings
-  console.log('\n' + '='.repeat(60));
-  console.log('FINDINGS');
-  console.log('='.repeat(60));
+  // ── Phase 3: Navigate to /ATL, intercept any NEW bundles ─────────
+  console.log('\n\n[PHASE 3] Navigate to /ATL, look for page-specific bundles...');
+  const airportBundles = new Set();
 
-  console.log(`\n📍 ROUTES (${findings.routes.length} found — showing unique):`);
-  [...new Set(findings.routes.map(f => f.val))].slice(0, 40).forEach(v => console.log('  ', v));
-
-  console.log(`\n🔌 API ENDPOINTS (${findings.apiEndpoints.length} found):`);
-  [...new Set(findings.apiEndpoints.map(f => f.val))].forEach(v => console.log('  ', v));
-
-  console.log(`\n📡 FETCH CALLS (${findings.fetchCalls.length} found):`);
-  [...new Set(findings.fetchCalls.map(f => f.val))].forEach(v => console.log('  ', v));
-
-  console.log(`\n🗄️  SUPABASE REFERENCES (${findings.supabase.length} found):`);
-  findings.supabase.forEach(f => console.log(`  [${f.file}]`, f.val));
-
-  console.log(`\n✈️  AIRPORT CODE REFS (ATL mentions):`);
-  findings.airportRefs.forEach(f => console.log(`  [${f.file}]`, f.val));
-
-  console.log(`\n🌐 EXTERNAL URLS (${findings.misc.length} found — showing unique):`);
-  [...new Set(findings.misc.map(f => f.val))].slice(0, 30).forEach(v => console.log('  ', v));
-
-  // Step 4: Also try to find the page-level JS bundle specifically
-  // The homepage loads layout chunks. The airport page loads a page-specific chunk.
-  // Let's trigger it by navigating to the working URL.
-  console.log('\n[3] Loading /ATL to capture page-specific bundles...');
-  const airportBundles = [];
-  page.on('request', req => {
-    const u = req.url();
-    if (u.includes('/_next/static/chunks') && u.endsWith('.js') && !bundleUrls.includes(u)) {
-      airportBundles.push(u);
+  await page.route('**/_next/static/chunks/*.js*', async route => {
+    const url = route.request().url();
+    const name = url.split('/').pop().split('?')[0];
+    if (!KNOWN_BUNDLES.includes(name) && !interceptedBundles.has(name)) {
+      airportBundles.add(name);
     }
+    await route.continue();
   });
 
   await page.goto(`${BASE}/ATL`, { waitUntil: 'networkidle', timeout: 30000 });
   await page.waitForTimeout(3000);
 
-  console.log(`  New bundles loaded by /ATL page: ${airportBundles.length}`);
-  airportBundles.forEach(u => console.log('   ', u.split('/').pop().split('?')[0]));
-
-  if (airportBundles.length > 0) {
-    console.log('\n[4] Scanning airport-specific bundles...');
-    for (const url of airportBundles) {
-      const filename = url.split('/').pop().split('?')[0];
-      try {
-        const src = await page.evaluate(async (u) => {
-          const r = await fetch(u);
-          return r.text();
-        }, url);
-
-        console.log(`\n  📦 ${filename} (${src.length} chars)`);
-
-        // Print first 2000 chars — page bundles are often small and revealing
-        console.log('  CONTENT (first 2000 chars):');
-        console.log(src.slice(0, 2000));
-
-        // Targeted searches
-        const apiHits = src.match(/["'`](\/api\/[^"'`\s]{2,80})["'`]/g) || [];
-        const fetchHits = src.match(/fetch\([^)]{5,100}\)/g) || [];
-        const urlHits = src.match(/https?:\/\/[^\s"'`]{10,100}/g) || [];
-
-        if (apiHits.length) { console.log('\n  API routes:', apiHits); }
-        if (fetchHits.length) { console.log('\n  Fetch calls:', fetchHits); }
-        if (urlHits.length) { console.log('\n  URLs found:', urlHits.filter(u => !u.includes('google'))); }
-
-      } catch (e) {
-        console.log(`  ⚠️  Error reading ${filename}: ${e.message}`);
-      }
-    }
+  console.log(`  Intercepted ${airportBundles.size} airport-specific bundles`);
+  for (const name of airportBundles) {
+    await fetchAndScan(page, name);
   }
 
+  // ── Phase 4: Read the fully rendered DOM ─────────────────────────
+  console.log('\n\n[PHASE 4] Rendered DOM on /ATL:');
+  const text = await page.evaluate(() => document.body.innerText);
+  console.log(text.slice(0, 1500));
+
   await browser.close();
-  console.log('\n\nRECON v4 COMPLETE');
+  console.log('\n\nRECON v5 COMPLETE');
 })();
