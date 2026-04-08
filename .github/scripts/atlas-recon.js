@@ -1,19 +1,17 @@
-// atlas-recon-v3.js
-// WHAT CHANGED FROM v2:
-//   - Correct URL pattern confirmed: /ATL (no /airport/ prefix)
-//   - Waits for full JS hydration (up to 15s) not just networkidle
-//   - Intercepts RSC text/x-component streams (App Router data delivery)
-//   - Captures ALL fetch/XHR calls including post-hydration ones
-//   - Reads fully rendered DOM text after React mounts
-//   - Logs JS bundle contents snippet to find API endpoint strings
+// atlas-recon-v4.js
+// STRATEGY: Stop guessing URL patterns.
+// Instead: fetch and read the compiled JS bundles to find:
+//   - actual route definitions
+//   - API endpoint strings
+//   - any airport code references
+//   - fetch/axios calls with real URLs
 
 const { chromium } = require('playwright');
 
-const TEST_AIRPORT = 'ATL';
-const TARGET_URL = `https://atlas-navigation.com/${TEST_AIRPORT}`;
+const BASE = 'https://atlas-navigation.com';
 
 (async () => {
-  console.log(`\nATLAS RECON v3 — Deep hydration probe for ${TEST_AIRPORT}`);
+  console.log('\nATLAS RECON v4 — Reading JS bundles for routes + endpoints');
   console.log('='.repeat(60));
 
   const browser = await chromium.launch({
@@ -23,144 +21,153 @@ const TARGET_URL = `https://atlas-navigation.com/${TEST_AIRPORT}`;
 
   const page = await browser.newPage();
 
-  // Track every single request and response
-  const allRequests = [];
-  const allResponses = [];
-
+  // Step 1: Load the homepage (always works) to get bundle URLs
+  console.log('\n[1] Loading homepage to collect bundle URLs...');
+  const bundleUrls = [];
   page.on('request', req => {
-    allRequests.push({ url: req.url(), method: req.method() });
+    const u = req.url();
+    if (u.includes('/_next/static/chunks') && u.endsWith('.js')) {
+      bundleUrls.push(u);
+    }
   });
 
-  page.on('response', async (response) => {
-    const url = response.url();
-    const ct = response.headers()['content-type'] || '';
-    const status = response.status();
+  await page.goto(BASE, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.waitForTimeout(2000);
+  console.log(`  Found ${bundleUrls.length} JS bundles`);
 
-    // Skip static assets
-    if (url.includes('.png') || url.includes('.ico') || url.includes('.woff')) return;
+  // Step 2: Fetch and scan EVERY bundle for useful strings
+  console.log('\n[2] Scanning all bundles...');
 
+  const findings = {
+    routes: [],
+    apiEndpoints: [],
+    fetchCalls: [],
+    supabase: [],
+    airportRefs: [],
+    misc: []
+  };
+
+  for (const url of bundleUrls) {
+    let src = '';
     try {
-      // Capture RSC streams (text/x-component is App Router RSC payload)
-      if (ct.includes('text/x-component') || ct.includes('text/plain')) {
-        const text = await response.text().catch(() => '');
-        if (text.length > 10) {
-          allResponses.push({ type: 'RSC', url, ct, body: text.slice(0, 3000) });
-        }
-      }
-      // Capture JSON
-      else if (ct.includes('application/json')) {
-        const body = await response.json().catch(() => null);
-        if (body) {
-          allResponses.push({ type: 'JSON', url, ct, body: JSON.stringify(body, null, 2).slice(0, 3000) });
-        }
-      }
-      // Capture _next/data routes (pages router data)
-      else if (url.includes('/_next/data/')) {
-        const text = await response.text().catch(() => '');
-        allResponses.push({ type: 'NEXT_DATA_ROUTE', url, ct, body: text.slice(0, 3000) });
-      }
-    } catch (_) {}
-  });
+      const resp = await page.evaluate(async (u) => {
+        const r = await fetch(u);
+        return r.text();
+      }, url);
+      src = resp;
+    } catch (e) {
+      console.log(`  ⚠️  Could not fetch: ${url.split('/').pop()}`);
+      continue;
+    }
 
-  // ── Navigate ────────────────────────────────────────────────────────
-  await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const filename = url.split('/').pop().split('?')[0];
+    const hits = [];
 
-  // ── Strategy 1: Wait for a number to appear (wait time rendered) ────
-  console.log('\n⏳ Waiting up to 12s for wait time data to render...');
-  try {
-    await page.waitForFunction(
-      () => {
-        const text = document.body.innerText;
-        return /\d+\s*min/i.test(text) || text.includes('Standard') || text.includes('PreCheck') || text.includes('checkpoint');
-      },
-      { timeout: 12000 }
-    );
-    console.log('✅ Data appeared in DOM!');
-  } catch (_) {
-    console.log('⚠️  Timed out waiting for data — dumping what we have anyway');
+    // Route patterns
+    const routeMatches = src.match(/["'`]\/[a-zA-Z][a-zA-Z0-9\-_/[\]]{2,60}["'`]/g) || [];
+    routeMatches
+      .filter(m => !m.includes('_next') && !m.includes('static') && !m.includes('.js') && !m.includes('.css'))
+      .forEach(m => findings.routes.push({ file: filename, val: m }));
+
+    // API endpoints
+    const apiMatches = src.match(/["'`](\/api\/[^"'`\s]{2,60})["'`]/g) || [];
+    apiMatches.forEach(m => findings.apiEndpoints.push({ file: filename, val: m }));
+
+    // External fetch/axios calls
+    const fetchMatches = src.match(/fetch\(["'`][^"'`]{8,100}["'`]/g) || [];
+    fetchMatches.forEach(m => findings.fetchCalls.push({ file: filename, val: m }));
+
+    // Supabase
+    if (/supabase/i.test(src)) {
+      const sbMatches = src.match(/.{0,40}supabase.{0,80}/gi) || [];
+      sbMatches.forEach(m => findings.supabase.push({ file: filename, val: m }));
+    }
+
+    // Airport code references
+    if (/\bATL\b/.test(src)) {
+      const atlMatches = src.match(/.{0,30}\bATL\b.{0,60}/g) || [];
+      atlMatches.slice(0, 5).forEach(m => findings.airportRefs.push({ file: filename, val: m }));
+    }
+
+    // URLs with domain
+    const urlMatches = src.match(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-_/?=&%]{10,100}/g) || [];
+    urlMatches
+      .filter(u => !u.includes('google') && !u.includes('gtag') && !u.includes('doubleclick') && !u.includes('atlas-navigation.com/og'))
+      .forEach(m => findings.misc.push({ file: filename, val: m }));
   }
 
-  // Extra settle time for any post-render fetches
+  // Step 3: Print findings
+  console.log('\n' + '='.repeat(60));
+  console.log('FINDINGS');
+  console.log('='.repeat(60));
+
+  console.log(`\n📍 ROUTES (${findings.routes.length} found — showing unique):`);
+  [...new Set(findings.routes.map(f => f.val))].slice(0, 40).forEach(v => console.log('  ', v));
+
+  console.log(`\n🔌 API ENDPOINTS (${findings.apiEndpoints.length} found):`);
+  [...new Set(findings.apiEndpoints.map(f => f.val))].forEach(v => console.log('  ', v));
+
+  console.log(`\n📡 FETCH CALLS (${findings.fetchCalls.length} found):`);
+  [...new Set(findings.fetchCalls.map(f => f.val))].forEach(v => console.log('  ', v));
+
+  console.log(`\n🗄️  SUPABASE REFERENCES (${findings.supabase.length} found):`);
+  findings.supabase.forEach(f => console.log(`  [${f.file}]`, f.val));
+
+  console.log(`\n✈️  AIRPORT CODE REFS (ATL mentions):`);
+  findings.airportRefs.forEach(f => console.log(`  [${f.file}]`, f.val));
+
+  console.log(`\n🌐 EXTERNAL URLS (${findings.misc.length} found — showing unique):`);
+  [...new Set(findings.misc.map(f => f.val))].slice(0, 30).forEach(v => console.log('  ', v));
+
+  // Step 4: Also try to find the page-level JS bundle specifically
+  // The homepage loads layout chunks. The airport page loads a page-specific chunk.
+  // Let's trigger it by navigating to the working URL.
+  console.log('\n[3] Loading /ATL to capture page-specific bundles...');
+  const airportBundles = [];
+  page.on('request', req => {
+    const u = req.url();
+    if (u.includes('/_next/static/chunks') && u.endsWith('.js') && !bundleUrls.includes(u)) {
+      airportBundles.push(u);
+    }
+  });
+
+  await page.goto(`${BASE}/ATL`, { waitUntil: 'networkidle', timeout: 30000 });
   await page.waitForTimeout(3000);
 
-  // ── Read fully rendered DOM ──────────────────────────────────────────
-  const renderedText = await page.evaluate(() => document.body.innerText);
-  console.log('\n📄 FULLY RENDERED PAGE TEXT (first 2000 chars):');
-  console.log(renderedText.slice(0, 2000));
+  console.log(`  New bundles loaded by /ATL page: ${airportBundles.length}`);
+  airportBundles.forEach(u => console.log('   ', u.split('/').pop().split('?')[0]));
 
-  // ── All non-Google/non-static requests ──────────────────────────────
-  console.log('\n🌐 ALL REQUESTS (post-hydration included):');
-  allRequests
-    .filter(r =>
-      !r.url.includes('google') &&
-      !r.url.includes('doubleclick') &&
-      !r.url.includes('gtag') &&
-      !r.url.includes('.png') &&
-      !r.url.includes('.woff') &&
-      !r.url.includes('.ico') &&
-      !r.url.includes('.css')
-    )
-    .forEach(r => console.log(`  [${r.method}] ${r.url}`));
+  if (airportBundles.length > 0) {
+    console.log('\n[4] Scanning airport-specific bundles...');
+    for (const url of airportBundles) {
+      const filename = url.split('/').pop().split('?')[0];
+      try {
+        const src = await page.evaluate(async (u) => {
+          const r = await fetch(u);
+          return r.text();
+        }, url);
 
-  // ── Captured API/RSC responses ───────────────────────────────────────
-  if (allResponses.length) {
-    console.log(`\n📡 CAPTURED RESPONSES (${allResponses.length} total):`);
-    allResponses.forEach((r, i) => {
-      console.log(`\n--- [${i + 1}] TYPE: ${r.type} ---`);
-      console.log(`URL: ${r.url}`);
-      console.log(`Content-Type: ${r.ct}`);
-      console.log(`Body:\n${r.body}`);
-    });
-  } else {
-    console.log('\n📡 No API/RSC responses captured');
-  }
+        console.log(`\n  📦 ${filename} (${src.length} chars)`);
 
-  // ── Scan JS bundles for API endpoint strings ─────────────────────────
-  console.log('\n🔍 Scanning JS bundles for API/fetch/supabase strings...');
-  const jsBundles = allRequests
-    .filter(r => r.url.includes('atlas-navigation.com/_next/static/chunks') && r.url.endsWith('.js'))
-    .slice(0, 5); // only first 5 to keep runtime short
+        // Print first 2000 chars — page bundles are often small and revealing
+        console.log('  CONTENT (first 2000 chars):');
+        console.log(src.slice(0, 2000));
 
-  for (const bundle of jsBundles) {
-    try {
-      const resp = await page.evaluate(async (url) => {
-        const r = await fetch(url);
-        return r.text();
-      }, bundle.url);
+        // Targeted searches
+        const apiHits = src.match(/["'`](\/api\/[^"'`\s]{2,80})["'`]/g) || [];
+        const fetchHits = src.match(/fetch\([^)]{5,100}\)/g) || [];
+        const urlHits = src.match(/https?:\/\/[^\s"'`]{10,100}/g) || [];
 
-      // Look for anything that looks like an API route or database call
-      const hits = [];
-      const patterns = [
-        /["'`](\/api\/[^"'`\s]{3,50})["'`]/g,
-        /["'`](https?:\/\/[^"'`\s]{10,80})["'`]/g,
-        /supabase/gi,
-        /fetch\([^)]{5,80}\)/g,
-        /axios\.[a-z]+\([^)]{5,80}\)/g,
-        /endpoint['":\s]+["'`][^"'`]{5,60}["'`]/gi,
-        /baseUrl['":\s]+["'`][^"'`]{5,60}["'`]/gi,
-      ];
+        if (apiHits.length) { console.log('\n  API routes:', apiHits); }
+        if (fetchHits.length) { console.log('\n  Fetch calls:', fetchHits); }
+        if (urlHits.length) { console.log('\n  URLs found:', urlHits.filter(u => !u.includes('google'))); }
 
-      for (const pattern of patterns) {
-        let m;
-        const re = new RegExp(pattern.source, pattern.flags);
-        while ((m = re.exec(resp)) !== null) {
-          hits.push(m[0].slice(0, 120));
-          if (hits.length > 30) break;
-        }
+      } catch (e) {
+        console.log(`  ⚠️  Error reading ${filename}: ${e.message}`);
       }
-
-      if (hits.length) {
-        console.log(`\n  Bundle: ${bundle.url.split('/').pop()}`);
-        hits.forEach(h => console.log(`    → ${h}`));
-      }
-    } catch (_) {}
+    }
   }
-
-  // ── Full HTML (first 3000 chars post-hydration) ──────────────────────
-  const html = await page.content();
-  console.log('\n📋 POST-HYDRATION HTML (first 3000 chars):');
-  console.log(html.slice(0, 3000));
 
   await browser.close();
-  console.log('\n\nRECON v3 COMPLETE');
+  console.log('\n\nRECON v4 COMPLETE');
 })();
