@@ -3,29 +3,34 @@ const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 const AIRPORTS = [
-  { code: 'DFW', name: 'Dallas/Fort Worth International Airport', venueId: 'dfw' },
-  { code: 'MSP', name: 'Minneapolis-St. Paul International Airport', venueId: 'msp' }
+  { code: 'DFW', name: 'Dallas/Fort Worth International', venueId: 'dfw' },
+  { code: 'MSP', name: 'Minneapolis-St. Paul International', venueId: 'msp' },
+  { code: 'MCO', name: 'Orlando International', venueId: 'mco' },
+  { code: 'DEN', name: 'Denver International', venueId: 'den' },
+  { code: 'PHX', name: 'Phoenix Sky Harbor International', venueId: 'phx' },
+  { code: 'SEA', name: 'Seattle-Tacoma International', venueId: 'sea' }
 ];
 
-function getLocalTimeCT() {
-  return new Date().toLocaleString('en-US', {
-    timeZone: 'America/Chicago', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
-  });
-}
+const timeFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Chicago',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: 'numeric',
+  minute: '2-digit',
+  hour12: true
+});
 
 function extractTerminal(floorId, airportCode) {
   if (!floorId) return 'Main';
   const fid = floorId.toLowerCase();
-  
   if (airportCode === 'DFW') {
     const match = fid.match(/terminal([a-e])/);
-    return match ? match[1].toUpperCase() : 'Unknown';
+    return match ? match[1].toUpperCase() : 'Main';
   }
-  
-  if (airportCode === 'MSP') {
-    // Matches "terminal1" or "terminal2" in the floorId string
+  if (['MSP', 'PHX', 'MCO'].includes(airportCode)) {
     const match = fid.match(/terminal(\d)/);
-    return match ? `T${match[1]}` : 'T1';
+    return match ? `T${match[1]}` : 'Main';
   }
   return 'Main';
 }
@@ -36,8 +41,8 @@ function normalizeQueueType(queueSubtype) {
 }
 
 async function runSync() {
-  const now = new Date().toISOString();
-  const localTimeCT = getLocalTimeCT();
+  const nowRaw = new Date();
+  const nowISO = nowRaw.toISOString();
 
   for (const airport of AIRPORTS) {
     try {
@@ -45,23 +50,23 @@ async function runSync() {
       const json = await resp.json();
       const data = json.data;
 
-      // UPDATED FILTER: Catch both 'security.checkpoint' AND 'security'
       const checkpoints = Object.values(data).filter(poi => 
         (poi.category === 'security.checkpoint' || poi.category === 'security') && 
         poi.dynamicData?.queue
       );
 
-      console.log(`[${airport.code}] Processing ${checkpoints.length} checkpoints...`);
+      console.log(`[${airport.code}] Syncing ${checkpoints.length} checkpoints...`);
 
       for (const cp of checkpoints) {
         const queue = cp.dynamicData.queue;
         const terminal = extractTerminal(cp.position?.floorId, airport.code);
-        
-        // Use the POI name if checkpoint_name is needed, or just terminal/type
         const queueType = normalizeQueueType(cp.queue?.queueSubtype);
         const isVerified = !queue.isQueueTimeDefault;
         const isClosed = cp.isClosed === true || cp.isTemporarilyClosed === true;
         const waitMinutes = isClosed ? null : (queue.queueTime ?? null);
+
+        // Create the simplified local time string
+        const prettyTime = timeFormatter.format(cp.timestamp ? new Date(cp.timestamp) : nowRaw);
 
         await supabase.rpc('upsert_wait_time', {
           p_airport_code: airport.code,
@@ -69,15 +74,14 @@ async function runSync() {
           p_terminal: terminal,
           p_queue_type: queueType,
           p_wait_minutes: waitMinutes,
-          p_last_updated: cp.timestamp ? new Date(cp.timestamp).toISOString() : now,
-          p_fetched_at: now,
-          p_local_time_ct: localTimeCT,
+          p_last_updated: prettyTime, // Sends: MM/DD/YYYY, 0:00 PM
+          p_fetched_at: nowISO,
           p_is_verified: isVerified
         });
       }
-      console.log(`[${airport.code}] Sync complete.`);
+      console.log(`[${airport.code}] Success.`);
     } catch (err) {
-      console.error(`[${airport.code}] Error:`, err.message);
+      console.error(`[${airport.code}] Sync Error:`, err.message);
     }
   }
 }
