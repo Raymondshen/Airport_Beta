@@ -35,7 +35,6 @@ function extractTerminal(floorId, airportCode) {
 
 function normalizeQueueType(queueSubtype) {
   const s = (queueSubtype || '').toLowerCase();
-  // Catches 'tsapre', 'tsa_precheck', and 'precheck' all as 'precheck'
   if (s.includes('pre')) return 'precheck';
   if (s.includes('priority')) return 'priority';
   return 'standard';
@@ -70,6 +69,7 @@ async function runSync() {
         const waitMinutes = isClosed ? null : (queue.queueTime ?? null);
         const prettyTime = timeFormatter.format(cp.timestamp ? new Date(cp.timestamp) : nowRaw);
 
+        // RPC CALL: Stripped of local_time_ct and type
         await supabase.rpc('upsert_wait_time', {
           p_airport_code: airport.code,
           p_airport_name: airport.name,
