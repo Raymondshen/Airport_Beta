@@ -77,7 +77,7 @@ async function runSync() {
           p_checkpoint_name: checkpointName,
           p_queue_type: queueType,
           p_wait_minutes: waitMinutes,
-          p_last_updated: prettyTime,
+          p_last_updated: nowISO,
           p_fetched_at: nowISO,
           p_is_verified: isVerified
         });
